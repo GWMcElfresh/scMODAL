@@ -1,14 +1,27 @@
-FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-COPY pyproject.toml .
-RUN apt-get update && apt-get install -y g++ && \
-    uv sync --no-dev --no-install-project
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    git \
+    python3 \
+    python3-dev \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
 
+COPY LICENSE README.md pyproject.toml ./
 COPY scmodal/ ./scmodal/
 
-ENV PATH=/app/.venv/bin:$PATH
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 torch==2.4.1 && \
+    python3 -m pip install .
+
 ENV PYTHONPATH=/app
 
-CMD ["python"]
+CMD ["python3"]
