@@ -8,14 +8,20 @@ We introduce scMODAL, a deep learning framework tailored for single-cell multi-o
 ![scMODAL_overview](https://github.com/gefeiwang/scMODAL/blob/main/demos/Overview.png)
 
 ## Installation
-scMODAL can be installed from from GitHub:
+scMODAL can be installed from GitHub using [uv](https://docs.astral.sh/uv/):
 ```bash
 git clone https://github.com/gefeiwang/scMODAL.git
 cd scMODAL
-conda env update --f environment.yml
-conda activate scmodal
+uv sync
+source .venv/bin/activate
 ```
 Normally the installation time is less than 5 minutes.
+
+Alternatively, conda users can still use the provided `environment.yml`:
+```bash
+conda env update -f environment.yml
+conda activate scmodal
+```
 
 ## Quick Start
 
