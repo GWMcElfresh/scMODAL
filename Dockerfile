@@ -3,7 +3,7 @@ FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 WORKDIR /app
 
 COPY pyproject.toml .
-RUN RUN apt-get update && apt-get install -y g++ && \
+RUN apt-get update && apt-get install -y g++ && \
     uv sync --no-dev --no-install-project
 
 COPY scmodal/ ./scmodal/
