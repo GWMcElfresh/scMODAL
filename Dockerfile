@@ -20,7 +20,7 @@ COPY scmodal/ ./scmodal/
 
 RUN python3 -m pip install --upgrade pip setuptools wheel && \
     python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 torch==2.4.1 && \
-    python3 -m pip install . /
+    python3 -m pip install . && /
     python3 -m pip install mygene
 
 ENV PYTHONPATH=/app
