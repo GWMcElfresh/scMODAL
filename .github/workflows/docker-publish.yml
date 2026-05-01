@@ -46,5 +46,5 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ghcr.io/gwmcelfresh/scmodal:latest
           labels: ${{ steps.meta.outputs.labels }}
