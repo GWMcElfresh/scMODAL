@@ -37,6 +37,22 @@ model.eval() # get integrated latent representation of cells
 ```
 `model.latent` stores the integrated latent representation of cells, enabling downstream integrative analysis.
 
+### Checkpointing & Resume
+
+`model.train()` and `model.integrate_datasets_feats()` automatically save periodic checkpoints to `model_path/ckpt.pth`:
+
+| Method | Checkpoint interval |
+|---|---|
+| `train()` | Every 2000 steps |
+| `integrate_datasets_feats()` | Every 2000 steps |
+| `integrate_datasets_links()` | Every 200 steps |
+
+Each checkpoint includes **model weights, optimizer states, and current step number**. If training is interrupted, re-running `train()` with the same `model_path` detects the existing checkpoint and resumes from the saved step. Optimizer states (learning rate, momentum) are restored alongside weights, so the training dynamics are preserved across restarts.
+
+A **loss history CSV** (`result_path/loss_history.csv`) is written incrementally at the same intervals, recording per-step D/GAN/AE/Geo/LA/MNN losses. New rows are appended on resume — the file is never overwritten.
+
+On the first training step, a **GPU device confirmation** is printed verifying that data and model weights reside on the GPU (e.g. `x_A device = cuda:0, E_A weight device = cuda:0`).
+
 Alternatively, scMODAL also takes the inputs with linked features and all features in separate matrices. For example, three datasets can be integrated using 
 ```python
 model.integrate_datasets_feats(input_feats=[adata1.X, adata2.X, adata3.X],

@@ -40,6 +40,44 @@ class Model(object):
         self.result_path = result_path
 
 
+    # ------------------------------------------------------------------
+    # Helpers: checkpoint save/load and loss logging
+    # ------------------------------------------------------------------
+
+    def _ensure_model_dir(self):
+        if not os.path.exists(self.model_path):
+            os.makedirs(self.model_path, exist_ok=True)
+
+    def _ckpt_path(self):
+        return os.path.join(self.model_path, "ckpt.pth")
+
+    def _loss_history_path(self):
+        return os.path.join(self.result_path, "loss_history.csv")
+
+    def _append_loss_row(self, step, loss_D, loss_GAN, loss_AE, loss_Geo, loss_LA, loss_MNN):
+        """Append a row to loss_history.csv, creating the header if needed."""
+        path = self._loss_history_path()
+        row = pd.DataFrame([{
+            "step": step,
+            "loss_D": float(loss_D),
+            "loss_GAN": float(loss_GAN),
+            "loss_AE": float(loss_AE),
+            "loss_Geo": float(loss_Geo),
+            "loss_LA": float(loss_LA),
+            "loss_MNN": float(loss_MNN),
+        }])
+        row.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+
+    def _atomic_save(self, state, ckpt_path):
+        """Write checkpoint atomically: temp file then rename."""
+        tmp_path = ckpt_path + ".tmp"
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, ckpt_path)
+
+    # ------------------------------------------------------------------
+    # Preprocessing
+    # ------------------------------------------------------------------
+
     def preprocess(self, 
                    adata_A_input, 
                    adata_B_input, 
@@ -82,7 +120,7 @@ class Model(object):
 
     def train(self):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)), flush=True)
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.G_A = generator(self.emb_A.shape[1], self.n_latent).to(self.device)
@@ -91,6 +129,30 @@ class Model(object):
         params_G = list(self.E_A.parameters()) + list(self.E_B.parameters()) + list(self.G_A.parameters()) + list(self.G_B.parameters())
         optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
         optimizer_D = optim.Adam(list(self.D_Z.parameters()), lr=0.001, weight_decay=0.001)
+
+        # ------------------------------------------------------------------
+        # Resume from checkpoint if available
+        # ------------------------------------------------------------------
+        ckpt_path = self._ckpt_path()
+        step_start = 0
+        if os.path.exists(ckpt_path):
+            try:
+                ckpt = torch.load(ckpt_path, map_location=self.device)
+                if "step" in ckpt and "optimizer_G" in ckpt:
+                    self.E_A.load_state_dict(ckpt["E_A"])
+                    self.E_B.load_state_dict(ckpt["E_B"])
+                    self.G_A.load_state_dict(ckpt["G_A"])
+                    self.G_B.load_state_dict(ckpt["G_B"])
+                    self.D_Z.load_state_dict(ckpt["D_Z"])
+                    optimizer_G.load_state_dict(ckpt["optimizer_G"])
+                    optimizer_D.load_state_dict(ckpt["optimizer_D"])
+                    step_start = ckpt["step"] + 1
+                    print(f"SCMODAL: Resuming training from step {ckpt['step']}", flush=True)
+                else:
+                    print("SCMODAL: Checkpoint exists but lacks step/optimizer keys — training from scratch", flush=True)
+            except Exception as e:
+                print(f"SCMODAL: Could not load checkpoint ({e}) — training from scratch", flush=True)
+
         self.E_A.train()
         self.E_B.train()
         self.G_A.train()
@@ -100,12 +162,23 @@ class Model(object):
         N_A = self.emb_A.shape[0]
         N_B = self.emb_B.shape[0]
 
-        for step in range(self.training_steps):
+        # Initialize loss variables so final checkpoint doesn't fail on empty loop
+        loss_D = loss_G_GAN = loss_AE = loss_Geo = loss_LA = loss_MNN = float('nan')
+
+        for step in range(step_start, self.training_steps):
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             index_A = np.random.choice(np.arange(N_A), size=self.batch_size)
             index_B = np.random.choice(np.arange(N_B), size=self.batch_size)
             x_A = torch.from_numpy(self.emb_A[index_A, :]).float().to(self.device)
             x_B = torch.from_numpy(self.emb_B[index_B, :]).float().to(self.device)
+
+            # GPU confirmation on first step
+            if step == 0:
+                first_weight = next(self.E_A.parameters())
+                print(f"SCMODAL: GPU device = {self.device} — "
+                      f"x_A device = {x_A.device}, E_A weight device = {first_weight.device}",
+                      flush=True)
+
             z_A = self.E_A(x_A)
             z_B = self.E_B(x_B)
             x_AtoB = self.G_B(z_A)
@@ -158,27 +231,62 @@ class Model(object):
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
             optimizer_G.step()
 
+            # ------------------------------------------------------------------
+            # Periodic logging + checkpoint + loss history
+            # ------------------------------------------------------------------
             if not step % 2000:
+                loss_GAN_scalar = self.lambdaAE * loss_AE
+                loss_Geo_scalar = self.lambdaGeo * loss_Geo
+                loss_LA_scalar = self.lambdaLA * loss_LA
+                loss_MNN_scalar = self.lambdaMNN * loss_MNN
+
                 print("step %d, loss_D=%f, loss_GAN=%f, loss_AE=%f, loss_Geo=%f, loss_LA=%f, loss_MNN=%f"
-                 % (step, loss_D, loss_G_GAN, self.lambdaAE*loss_AE, self.lambdaGeo*loss_Geo, self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN))
+                 % (step, loss_D, loss_G_GAN, loss_GAN_scalar, loss_Geo_scalar, loss_LA_scalar, loss_MNN_scalar), flush=True)
+
+                # Save periodic checkpoint
+                self._ensure_model_dir()
+                self._append_loss_row(step, loss_D, loss_G_GAN, loss_GAN_scalar,
+                                      loss_Geo_scalar, loss_LA_scalar, loss_MNN_scalar)
+                state = {
+                    "version": 1,
+                    "step": step,
+                    "E_A": self.E_A.state_dict(), "E_B": self.E_B.state_dict(),
+                    "G_A": self.G_A.state_dict(), "G_B": self.G_B.state_dict(),
+                    "D_Z": self.D_Z.state_dict(),
+                    "optimizer_G": optimizer_G.state_dict(),
+                    "optimizer_D": optimizer_D.state_dict(),
+                    "loss_D": float(loss_D), "loss_GAN": float(loss_G_GAN),
+                    "loss_AE": float(loss_AE), "loss_Geo": float(loss_Geo),
+                    "loss_LA": float(loss_LA), "loss_MNN": float(loss_MNN),
+                }
+                self._atomic_save(state, ckpt_path)
 
         end_time = time.time()
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
+        print("Ending time: ", time.asctime(time.localtime(end_time)), flush=True)
         self.train_time = end_time - begin_time
-        print("Training takes %.2f seconds" % self.train_time)
+        print("Training takes %.2f seconds" % self.train_time, flush=True)
 
-        if not os.path.exists(self.model_path):
-            os.makedirs(self.model_path)
-
-        state = {'E_A': self.E_A.state_dict(), 'E_B': self.E_B.state_dict(),
-                 'G_A': self.G_A.state_dict(), 'G_B': self.G_B.state_dict()}
-
-        torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
+        # Final checkpoint (always saved, even if periodic saves happened)
+        self._ensure_model_dir()
+        state = {
+            "version": 1,
+            "step": self.training_steps - 1,
+            "E_A": self.E_A.state_dict(), "E_B": self.E_B.state_dict(),
+            "G_A": self.G_A.state_dict(), "G_B": self.G_B.state_dict(),
+            "D_Z": self.D_Z.state_dict(),
+            "optimizer_G": optimizer_G.state_dict(),
+            "optimizer_D": optimizer_D.state_dict(),
+            "loss_D": float(loss_D), "loss_GAN": float(loss_G_GAN),
+            "loss_AE": float(loss_AE), "loss_Geo": float(loss_Geo),
+            "loss_LA": float(loss_LA), "loss_MNN": float(loss_MNN),
+        }
+        self._atomic_save(state, ckpt_path)
+        print(f"SCMODAL: Final checkpoint saved at step {self.training_steps - 1}", flush=True)
 
 
     def eval(self):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)), flush=True)
 
         self.E_A = encoder(self.emb_A.shape[1], self.n_latent).to(self.device)
         self.E_B = encoder(self.emb_B.shape[1], self.n_latent).to(self.device)
@@ -200,9 +308,9 @@ class Model(object):
 
         end_time = time.time()
         
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
+        print("Ending time: ", time.asctime(time.localtime(end_time)), flush=True)
         self.eval_time = end_time - begin_time
-        print("Evaluating takes %.2f seconds" % self.eval_time)
+        print("Evaluating takes %.2f seconds" % self.eval_time, flush=True)
 
         self.latent = np.concatenate((z_A.detach().cpu().numpy(), z_B.detach().cpu().numpy()), axis=0)
         self.data_Aspace = np.concatenate((self.emb_A, x_BtoA.detach().cpu().numpy()), axis=0)
@@ -230,7 +338,7 @@ class Model(object):
                                  input_MNN=None, # A list of features matrices for finding MNN pairs between datasets; set as the same as input_feats if "input_MNN=None"
                                  ):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)), flush=True)
         num_datasets = len(input_feats)
         assert len(feat_links_MNN) == (num_datasets-1)
         self.E_dict = {}
@@ -250,13 +358,39 @@ class Model(object):
             params_D += self.D_dict[i].parameters()
         optimizer_D = optim.Adam(params_D, lr=0.001, weight_decay=0.001)
 
+        # ------------------------------------------------------------------
+        # Resume from checkpoint if available
+        # ------------------------------------------------------------------
+        ckpt_path = self._ckpt_path()
+        step_start = 0
+        if os.path.exists(ckpt_path):
+            try:
+                ckpt = torch.load(ckpt_path, map_location=self.device)
+                if "step" in ckpt and self._check_multispecies_ckpt(ckpt, num_datasets):
+                    for i in range(num_datasets):
+                        self.E_dict[i].load_state_dict(ckpt[f"E_{i}"])
+                        self.G_dict[i].load_state_dict(ckpt[f"G_{i}"])
+                    for i in range(num_datasets - 1):
+                        self.D_dict[i].load_state_dict(ckpt[f"D_{i}"])
+                    optimizer_G.load_state_dict(ckpt["optimizer_G"])
+                    optimizer_D.load_state_dict(ckpt["optimizer_D"])
+                    step_start = ckpt["step"] + 1
+                    print(f"SCMODAL: Resuming integrate_datasets_links from step {ckpt['step']}", flush=True)
+                else:
+                    print("SCMODAL: Checkpoint lacks step/multi-species keys — training from scratch", flush=True)
+            except Exception as e:
+                print(f"SCMODAL: Could not load checkpoint ({e}) — training from scratch", flush=True)
+
         for i in range(num_datasets):
             self.E_dict[i].train()
             self.G_dict[i].train()
         for i in range(num_datasets-1):
             self.D_dict[i].train()
 
-        for step in range(self.training_steps):
+        # Initialize loss variables so final checkpoint doesn't fail on empty loop
+        loss_D = loss_G_GAN = loss_AE = loss_Geo = loss_LA = loss_MNN = float('nan')
+        gpu_logged = False
+        for step in range(step_start, self.training_steps):
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             x_dict = {}
             z_dict = {}
@@ -274,6 +408,14 @@ class Model(object):
                 z_dict[i] = self.E_dict[i](x_dict[i])
                 K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
                 K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
+
+                # GPU confirmation on first step, first dataset
+                if step == 0 and i == 0 and not gpu_logged:
+                    w = next(self.E_dict[i].parameters())
+                    print(f"SCMODAL: GPU device = {self.device} — "
+                          f"x_dict[{i}] device = {x_dict[i].device}, "
+                          f"E_dict[{i}] weight device = {w.device}", flush=True)
+                    gpu_logged = True
 
             # discriminator loss:
             for _ in range(5):
@@ -324,27 +466,69 @@ class Model(object):
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
             optimizer_G.step()
 
+            # ------------------------------------------------------------------
+            # Periodic logging + checkpoint + loss history (every 200 steps)
+            # ------------------------------------------------------------------
             if not step % 200:
+                loss_GAN_scalar = self.lambdaAE * loss_AE
+                loss_Geo_scalar = self.lambdaGeo * loss_Geo
+                loss_LA_scalar = self.lambdaLA * loss_LA
+                loss_MNN_scalar = self.lambdaMNN * loss_MNN
+
                 print("step %d, loss_D=%f, loss_GAN=%f, loss_AE=%f, loss_Geo=%f, loss_LA=%f, loss_MNN=%f"
-                 % (step, loss_D, loss_G_GAN, self.lambdaAE*loss_AE, self.lambdaGeo*loss_Geo, self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN))
+                 % (step, loss_D, loss_G_GAN, loss_GAN_scalar, loss_Geo_scalar, loss_LA_scalar, loss_MNN_scalar), flush=True)
+
+                # Save periodic checkpoint
+                self._ensure_model_dir()
+                self._append_loss_row(step, loss_D, loss_G_GAN, loss_GAN_scalar,
+                                      loss_Geo_scalar, loss_LA_scalar, loss_MNN_scalar)
+                state = {"version": 1, "step": step}
+                for i in range(num_datasets):
+                    state[f"E_{i}"] = self.E_dict[i].state_dict()
+                    state[f"G_{i}"] = self.G_dict[i].state_dict()
+                for i in range(num_datasets - 1):
+                    state[f"D_{i}"] = self.D_dict[i].state_dict()
+                state["optimizer_G"] = optimizer_G.state_dict()
+                state["optimizer_D"] = optimizer_D.state_dict()
+                state["loss_D"] = float(loss_D)
+                state["loss_GAN"] = float(loss_G_GAN)
+                state["loss_AE"] = float(loss_AE)
+                state["loss_Geo"] = float(loss_Geo)
+                state["loss_LA"] = float(loss_LA)
+                state["loss_MNN"] = float(loss_MNN)
+                self._atomic_save(state, ckpt_path)
 
         end_time = time.time()
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
+        print("Ending time: ", time.asctime(time.localtime(end_time)), flush=True)
         self.train_time = end_time - begin_time
-        print("Training takes %.2f seconds" % self.train_time)
+        print("Training takes %.2f seconds" % self.train_time, flush=True)
 
-        begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        eval_begin_time = time.time()
+        print("Begining time: ", time.asctime(time.localtime(eval_begin_time)), flush=True)
 
         for i in range(num_datasets):
             self.E_dict[i].train()
             z_dict[i] = self.E_dict[i](torch.from_numpy(input_feats[i]).float().to(self.device))
 
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
-        self.eval_time = end_time - begin_time
-        print("Evaluating takes %.2f seconds" % self.eval_time)
+        eval_end_time = time.time()
+        print("Ending time: ", time.asctime(time.localtime(eval_end_time)), flush=True)
+        self.eval_time = eval_end_time - eval_begin_time
+        print("Evaluating takes %.2f seconds" % self.eval_time, flush=True)
 
         self.latent = np.concatenate([z_dict[i].detach().cpu().numpy() for i in range(num_datasets)], axis=0)
+
+        # Final checkpoint
+        self._ensure_model_dir()
+        state = {"version": 1, "step": self.training_steps - 1}
+        for i in range(num_datasets):
+            state[f"E_{i}"] = self.E_dict[i].state_dict()
+            state[f"G_{i}"] = self.G_dict[i].state_dict()
+        for i in range(num_datasets - 1):
+            state[f"D_{i}"] = self.D_dict[i].state_dict()
+        state["optimizer_G"] = optimizer_G.state_dict()
+        state["optimizer_D"] = optimizer_D.state_dict()
+        self._atomic_save(state, ckpt_path)
+        print(f"SCMODAL: Final integrate_datasets_links checkpoint saved", flush=True)
 
 
     def integrate_datasets_feats(self, # Use this function for N >= 3 datasets when provided linked features for MNN
@@ -352,7 +536,7 @@ class Model(object):
                                  paired_input_MNN, # In the form of [[link_feat_data1, link_feat_data2], ..., [link_feat_data(N_1), link_feat_dataN]]
                                  ):
         begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        print("Begining time: ", time.asctime(time.localtime(begin_time)), flush=True)
         num_datasets = len(input_feats)
         self.E_dict = {}
         self.G_dict = {}
@@ -371,13 +555,39 @@ class Model(object):
             params_D += self.D_dict[i].parameters()
         optimizer_D = optim.Adam(params_D, lr=0.001, weight_decay=0.001)
 
+        # ------------------------------------------------------------------
+        # Resume from checkpoint if available
+        # ------------------------------------------------------------------
+        ckpt_path = self._ckpt_path()
+        step_start = 0
+        if os.path.exists(ckpt_path):
+            try:
+                ckpt = torch.load(ckpt_path, map_location=self.device)
+                if "step" in ckpt and self._check_multispecies_ckpt(ckpt, num_datasets):
+                    for i in range(num_datasets):
+                        self.E_dict[i].load_state_dict(ckpt[f"E_{i}"])
+                        self.G_dict[i].load_state_dict(ckpt[f"G_{i}"])
+                    for i in range(num_datasets - 1):
+                        self.D_dict[i].load_state_dict(ckpt[f"D_{i}"])
+                    optimizer_G.load_state_dict(ckpt["optimizer_G"])
+                    optimizer_D.load_state_dict(ckpt["optimizer_D"])
+                    step_start = ckpt["step"] + 1
+                    print(f"SCMODAL: Resuming integrate_datasets_feats from step {ckpt['step']}", flush=True)
+                else:
+                    print("SCMODAL: Checkpoint lacks step/multi-species keys — training from scratch", flush=True)
+            except Exception as e:
+                print(f"SCMODAL: Could not load checkpoint ({e}) — training from scratch", flush=True)
+
         for i in range(num_datasets):
             self.E_dict[i].train()
             self.G_dict[i].train()
         for i in range(num_datasets-1):
             self.D_dict[i].train()
 
-        for step in range(self.training_steps):
+        # Initialize loss variables so final checkpoint doesn't fail on empty loop
+        loss_D = loss_G_GAN = loss_AE = loss_Geo = loss_LA = loss_MNN = float('nan')
+        gpu_logged = False
+        for step in range(step_start, self.training_steps):
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             x_dict = {}
             z_dict = {}
@@ -396,6 +606,14 @@ class Model(object):
                 z_dict[i] = self.E_dict[i](x_dict[i])
                 K_dict[i] = torch.exp(-torch.mean((x_dict[i].view(self.batch_size, 1, -1) - x_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
                 K_z_dict[i] = torch.exp(-torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i].view(1, self.batch_size, -1))**2, dim=2)/2)
+
+                # GPU confirmation on first step, first dataset
+                if step == 0 and i == 0 and not gpu_logged:
+                    w = next(self.E_dict[i].parameters())
+                    print(f"SCMODAL: GPU device = {self.device} — "
+                          f"x_dict[{i}] device = {x_dict[i].device}, "
+                          f"E_dict[{i}] weight device = {w.device}", flush=True)
+                    gpu_logged = True
 
             # discriminator loss:
             for _ in range(5):
@@ -441,34 +659,80 @@ class Model(object):
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
             optimizer_G.step()
 
+            # ------------------------------------------------------------------
+            # Periodic logging + checkpoint + loss history (every 2000 steps)
+            # ------------------------------------------------------------------
             if not step % 2000:
+                loss_GAN_scalar = self.lambdaAE * loss_AE
+                loss_Geo_scalar = self.lambdaGeo * loss_Geo
+                loss_LA_scalar = self.lambdaLA * loss_LA
+                loss_MNN_scalar = self.lambdaMNN * loss_MNN
+
                 print("step %d, loss_D=%f, loss_GAN=%f, loss_AE=%f, loss_Geo=%f, loss_LA=%f, loss_MNN=%f"
-                 % (step, loss_D, loss_G_GAN, self.lambdaAE*loss_AE, self.lambdaGeo*loss_Geo, self.lambdaLA*loss_LA, self.lambdaMNN*loss_MNN))
+                 % (step, loss_D, loss_G_GAN, loss_GAN_scalar, loss_Geo_scalar, loss_LA_scalar, loss_MNN_scalar), flush=True)
+
+                # Save periodic checkpoint
+                self._ensure_model_dir()
+                self._append_loss_row(step, loss_D, loss_G_GAN, loss_GAN_scalar,
+                                      loss_Geo_scalar, loss_LA_scalar, loss_MNN_scalar)
+                state = {"version": 1, "step": step}
+                for i in range(num_datasets):
+                    state[f"E_{i}"] = self.E_dict[i].state_dict()
+                    state[f"G_{i}"] = self.G_dict[i].state_dict()
+                for i in range(num_datasets - 1):
+                    state[f"D_{i}"] = self.D_dict[i].state_dict()
+                state["optimizer_G"] = optimizer_G.state_dict()
+                state["optimizer_D"] = optimizer_D.state_dict()
+                state["loss_D"] = float(loss_D)
+                state["loss_GAN"] = float(loss_G_GAN)
+                state["loss_AE"] = float(loss_AE)
+                state["loss_Geo"] = float(loss_Geo)
+                state["loss_LA"] = float(loss_LA)
+                state["loss_MNN"] = float(loss_MNN)
+                self._atomic_save(state, ckpt_path)
 
         end_time = time.time()
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
+        print("Ending time: ", time.asctime(time.localtime(end_time)), flush=True)
         self.train_time = end_time - begin_time
-        print("Training takes %.2f seconds" % self.train_time)
+        print("Training takes %.2f seconds" % self.train_time, flush=True)
 
-        begin_time = time.time()
-        print("Begining time: ", time.asctime(time.localtime(begin_time)))
+        eval_begin_time = time.time()
+        print("Begining time: ", time.asctime(time.localtime(eval_begin_time)), flush=True)
 
         for i in range(num_datasets):
             self.E_dict[i].train()
             z_dict[i] = self.E_dict[i](torch.from_numpy(input_feats[i]).float().to(self.device))
 
-        print("Ending time: ", time.asctime(time.localtime(end_time)))
-        self.eval_time = end_time - begin_time
-        print("Evaluating takes %.2f seconds" % self.eval_time)
+        eval_end_time = time.time()
+        print("Ending time: ", time.asctime(time.localtime(eval_end_time)), flush=True)
+        self.eval_time = eval_end_time - eval_begin_time
+        print("Evaluating takes %.2f seconds" % self.eval_time, flush=True)
 
         self.latent = np.concatenate([z_dict[i].detach().cpu().numpy() for i in range(num_datasets)], axis=0)
 
-        if not os.path.exists(self.model_path):
-            os.makedirs(self.model_path)
-
-        state = {}
+        # Final checkpoint
+        self._ensure_model_dir()
+        state = {"version": 1, "step": self.training_steps - 1}
         for i in range(num_datasets):
-            state['E_%d' % i] = self.E_dict[i].state_dict()
-            state['G_%d' % i] = self.G_dict[i].state_dict()
+            state[f"E_{i}"] = self.E_dict[i].state_dict()
+            state[f"G_{i}"] = self.G_dict[i].state_dict()
+        for i in range(num_datasets - 1):
+            state[f"D_{i}"] = self.D_dict[i].state_dict()
+        state["optimizer_G"] = optimizer_G.state_dict()
+        state["optimizer_D"] = optimizer_D.state_dict()
+        self._atomic_save(state, ckpt_path)
+        print(f"SCMODAL: Final integrate_datasets_feats checkpoint saved", flush=True)
 
-        torch.save(state, os.path.join(self.model_path, "ckpt.pth"))
+    # ------------------------------------------------------------------
+    # Checkpoint validation helper
+    # ------------------------------------------------------------------
+
+    def _check_multispecies_ckpt(self, ckpt, num_datasets):
+        """Verify a multi-species checkpoint has all expected keys."""
+        for i in range(num_datasets):
+            if f"E_{i}" not in ckpt or f"G_{i}" not in ckpt:
+                return False
+        for i in range(num_datasets - 1):
+            if f"D_{i}" not in ckpt:
+                return False
+        return "optimizer_G" in ckpt and "optimizer_D" in ckpt
