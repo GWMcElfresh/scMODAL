@@ -74,6 +74,31 @@ class Model(object):
         torch.save(state, tmp_path)
         os.replace(tmp_path, ckpt_path)
 
+    def save_checkpoint(self, step):
+        """Save current model state as a checkpoint. Safe to call from a signal handler."""
+        self._ensure_model_dir()
+        state = {"version": 1, "step": step}
+        # 2-species path
+        if hasattr(self, 'E_A') and self.E_A is not None:
+            state.update({
+                "E_A": self.E_A.state_dict(), "E_B": self.E_B.state_dict(),
+                "G_A": self.G_A.state_dict(), "G_B": self.G_B.state_dict(),
+                "D_Z": self.D_Z.state_dict(),
+            })
+        # Multi-species path
+        if hasattr(self, 'E_dict') and self.E_dict:
+            for i in self.E_dict:
+                state[f"E_{i}"] = self.E_dict[i].state_dict()
+                state[f"G_{i}"] = self.G_dict[i].state_dict()
+            for i in self.D_dict:
+                state[f"D_{i}"] = self.D_dict[i].state_dict()
+        if hasattr(self, 'optimizer_G') and self.optimizer_G is not None:
+            state["optimizer_G"] = self.optimizer_G.state_dict()
+        if hasattr(self, 'optimizer_D') and self.optimizer_D is not None:
+            state["optimizer_D"] = self.optimizer_D.state_dict()
+        self._atomic_save(state, self._ckpt_path())
+        print(f"SCMODAL: Checkpoint saved at step {step}", flush=True)
+
     # ------------------------------------------------------------------
     # Preprocessing
     # ------------------------------------------------------------------
@@ -127,8 +152,8 @@ class Model(object):
         self.G_B = generator(self.emb_B.shape[1], self.n_latent).to(self.device)
         self.D_Z = discriminator(self.n_latent).to(self.device)
         params_G = list(self.E_A.parameters()) + list(self.E_B.parameters()) + list(self.G_A.parameters()) + list(self.G_B.parameters())
-        optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
-        optimizer_D = optim.Adam(list(self.D_Z.parameters()), lr=0.001, weight_decay=0.001)
+        self.optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
+        self.optimizer_D = optim.Adam(list(self.D_Z.parameters()), lr=0.001, weight_decay=0.001)
 
         # ------------------------------------------------------------------
         # Resume from checkpoint if available
@@ -144,8 +169,8 @@ class Model(object):
                     self.G_A.load_state_dict(ckpt["G_A"])
                     self.G_B.load_state_dict(ckpt["G_B"])
                     self.D_Z.load_state_dict(ckpt["D_Z"])
-                    optimizer_G.load_state_dict(ckpt["optimizer_G"])
-                    optimizer_D.load_state_dict(ckpt["optimizer_D"])
+                    self.optimizer_G.load_state_dict(ckpt["optimizer_G"])
+                    self.optimizer_D.load_state_dict(ckpt["optimizer_D"])
                     step_start = ckpt["step"] + 1
                     print(f"SCMODAL: Resuming training from step {ckpt['step']}", flush=True)
                 else:
@@ -166,6 +191,7 @@ class Model(object):
         loss_D = loss_G_GAN = loss_AE = loss_Geo = loss_LA = loss_MNN = float('nan')
 
         for step in range(step_start, self.training_steps):
+            self.current_step = step
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             index_A = np.random.choice(np.arange(N_A), size=self.batch_size)
             index_B = np.random.choice(np.arange(N_B), size=self.batch_size)
@@ -198,10 +224,10 @@ class Model(object):
 
             # discriminator loss:
             for _ in range(5):
-                optimizer_D.zero_grad()
+                self.optimizer_D.zero_grad()
                 loss_D = (torch.log(1 + torch.exp(-self.D_Z(z_A))) + torch.log(1 + torch.exp(self.D_Z(z_B)))).mean()
                 loss_D.backward(retain_graph=True)
-                optimizer_D.step()
+                self.optimizer_D.step()
 
             # autoencoder loss:
             loss_AE_A = torch.mean((x_Arecon - x_A)**2)
@@ -225,11 +251,11 @@ class Model(object):
             z_dist = torch.mean((z_A.view(self.batch_size, 1, -1) - z_B.view(1, self.batch_size, -1))**2, dim=2)
             loss_MNN = torch.sum(Sim * z_dist) / torch.sum(Sim)
 
-            optimizer_G.zero_grad()
+            self.optimizer_G.zero_grad()
             loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
-            optimizer_G.step()
+            self.optimizer_G.step()
 
             # ------------------------------------------------------------------
             # Periodic logging + checkpoint + loss history
@@ -253,8 +279,8 @@ class Model(object):
                     "E_A": self.E_A.state_dict(), "E_B": self.E_B.state_dict(),
                     "G_A": self.G_A.state_dict(), "G_B": self.G_B.state_dict(),
                     "D_Z": self.D_Z.state_dict(),
-                    "optimizer_G": optimizer_G.state_dict(),
-                    "optimizer_D": optimizer_D.state_dict(),
+                    "optimizer_G": self.optimizer_G.state_dict(),
+                    "optimizer_D": self.optimizer_D.state_dict(),
                     "loss_D": float(loss_D), "loss_GAN": float(loss_G_GAN),
                     "loss_AE": float(loss_AE), "loss_Geo": float(loss_Geo),
                     "loss_LA": float(loss_LA), "loss_MNN": float(loss_MNN),
@@ -274,8 +300,8 @@ class Model(object):
             "E_A": self.E_A.state_dict(), "E_B": self.E_B.state_dict(),
             "G_A": self.G_A.state_dict(), "G_B": self.G_B.state_dict(),
             "D_Z": self.D_Z.state_dict(),
-            "optimizer_G": optimizer_G.state_dict(),
-            "optimizer_D": optimizer_D.state_dict(),
+            "optimizer_G": self.optimizer_G.state_dict(),
+            "optimizer_D": self.optimizer_D.state_dict(),
             "loss_D": float(loss_D), "loss_GAN": float(loss_G_GAN),
             "loss_AE": float(loss_AE), "loss_Geo": float(loss_Geo),
             "loss_LA": float(loss_LA), "loss_MNN": float(loss_MNN),
@@ -349,14 +375,14 @@ class Model(object):
             params_G += self.E_dict[i].parameters()
             self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
             params_G += self.G_dict[i].parameters()
-        optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
+        self.optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
 
         self.D_dict = {}
         params_D = []
         for i in range(num_datasets-1):
             self.D_dict[i] = discriminator(self.n_latent).to(self.device)
             params_D += self.D_dict[i].parameters()
-        optimizer_D = optim.Adam(params_D, lr=0.001, weight_decay=0.001)
+        self.optimizer_D = optim.Adam(params_D, lr=0.001, weight_decay=0.001)
 
         # ------------------------------------------------------------------
         # Resume from checkpoint if available
@@ -372,8 +398,8 @@ class Model(object):
                         self.G_dict[i].load_state_dict(ckpt[f"G_{i}"])
                     for i in range(num_datasets - 1):
                         self.D_dict[i].load_state_dict(ckpt[f"D_{i}"])
-                    optimizer_G.load_state_dict(ckpt["optimizer_G"])
-                    optimizer_D.load_state_dict(ckpt["optimizer_D"])
+                    self.optimizer_G.load_state_dict(ckpt["optimizer_G"])
+                    self.optimizer_D.load_state_dict(ckpt["optimizer_D"])
                     step_start = ckpt["step"] + 1
                     print(f"SCMODAL: Resuming integrate_datasets_links from step {ckpt['step']}", flush=True)
                 else:
@@ -391,6 +417,7 @@ class Model(object):
         loss_D = loss_G_GAN = loss_AE = loss_Geo = loss_LA = loss_MNN = float('nan')
         gpu_logged = False
         for step in range(step_start, self.training_steps):
+            self.current_step = step
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             x_dict = {}
             z_dict = {}
@@ -419,12 +446,12 @@ class Model(object):
 
             # discriminator loss:
             for _ in range(5):
-                optimizer_D.zero_grad()
+                self.optimizer_D.zero_grad()
                 loss_D = 0
                 for i in range(num_datasets-1):
                     loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
                 loss_D.backward(retain_graph=True)
-                optimizer_D.step()
+                self.optimizer_D.step()
 
             # autoencoder loss:
             loss_AE = 0
@@ -460,11 +487,11 @@ class Model(object):
                 z_dist = torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
                 loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
 
-            optimizer_G.zero_grad()
+            self.optimizer_G.zero_grad()
             loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
-            optimizer_G.step()
+            self.optimizer_G.step()
 
             # ------------------------------------------------------------------
             # Periodic logging + checkpoint + loss history (every 200 steps)
@@ -488,8 +515,8 @@ class Model(object):
                     state[f"G_{i}"] = self.G_dict[i].state_dict()
                 for i in range(num_datasets - 1):
                     state[f"D_{i}"] = self.D_dict[i].state_dict()
-                state["optimizer_G"] = optimizer_G.state_dict()
-                state["optimizer_D"] = optimizer_D.state_dict()
+                state["optimizer_G"] = self.optimizer_G.state_dict()
+                state["optimizer_D"] = self.optimizer_D.state_dict()
                 state["loss_D"] = float(loss_D)
                 state["loss_GAN"] = float(loss_G_GAN)
                 state["loss_AE"] = float(loss_AE)
@@ -525,8 +552,8 @@ class Model(object):
             state[f"G_{i}"] = self.G_dict[i].state_dict()
         for i in range(num_datasets - 1):
             state[f"D_{i}"] = self.D_dict[i].state_dict()
-        state["optimizer_G"] = optimizer_G.state_dict()
-        state["optimizer_D"] = optimizer_D.state_dict()
+        state["optimizer_G"] = self.optimizer_G.state_dict()
+        state["optimizer_D"] = self.optimizer_D.state_dict()
         self._atomic_save(state, ckpt_path)
         print(f"SCMODAL: Final integrate_datasets_links checkpoint saved", flush=True)
 
@@ -546,14 +573,14 @@ class Model(object):
             params_G += self.E_dict[i].parameters()
             self.G_dict[i] = generator(input_feats[i].shape[1], self.n_latent).to(self.device)
             params_G += self.G_dict[i].parameters()
-        optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
+        self.optimizer_G = optim.Adam(params_G, lr=0.001, weight_decay=0.001)
 
         self.D_dict = {}
         params_D = []
         for i in range(num_datasets-1):
             self.D_dict[i] = discriminator(self.n_latent).to(self.device)
             params_D += self.D_dict[i].parameters()
-        optimizer_D = optim.Adam(params_D, lr=0.001, weight_decay=0.001)
+        self.optimizer_D = optim.Adam(params_D, lr=0.001, weight_decay=0.001)
 
         # ------------------------------------------------------------------
         # Resume from checkpoint if available
@@ -569,8 +596,8 @@ class Model(object):
                         self.G_dict[i].load_state_dict(ckpt[f"G_{i}"])
                     for i in range(num_datasets - 1):
                         self.D_dict[i].load_state_dict(ckpt[f"D_{i}"])
-                    optimizer_G.load_state_dict(ckpt["optimizer_G"])
-                    optimizer_D.load_state_dict(ckpt["optimizer_D"])
+                    self.optimizer_G.load_state_dict(ckpt["optimizer_G"])
+                    self.optimizer_D.load_state_dict(ckpt["optimizer_D"])
                     step_start = ckpt["step"] + 1
                     print(f"SCMODAL: Resuming integrate_datasets_feats from step {ckpt['step']}", flush=True)
                 else:
@@ -588,6 +615,7 @@ class Model(object):
         loss_D = loss_G_GAN = loss_AE = loss_Geo = loss_LA = loss_MNN = float('nan')
         gpu_logged = False
         for step in range(step_start, self.training_steps):
+            self.current_step = step
             cos = nn.CosineSimilarity(dim=1, eps=1e-6)
             x_dict = {}
             z_dict = {}
@@ -617,12 +645,12 @@ class Model(object):
 
             # discriminator loss:
             for _ in range(5):
-                optimizer_D.zero_grad()
+                self.optimizer_D.zero_grad()
                 loss_D = 0
                 for i in range(num_datasets-1):
                     loss_D += (torch.log(1 + torch.exp(-self.D_dict[i](z_dict[i]))) + torch.log(1 + torch.exp(self.D_dict[i](z_dict[i+1])))).mean()
                 loss_D.backward(retain_graph=True)
-                optimizer_D.step()
+                self.optimizer_D.step()
 
             # autoencoder loss:
             loss_AE = 0
@@ -653,11 +681,11 @@ class Model(object):
                 z_dist = torch.mean((z_dict[i].view(self.batch_size, 1, -1) - z_dict[i+1].view(1, self.batch_size, -1))**2, dim=2)
                 loss_MNN += torch.sum(Sim * z_dist) / torch.sum(Sim)
 
-            optimizer_G.zero_grad()
+            self.optimizer_G.zero_grad()
             loss_G = self.lambdaGAN * loss_G_GAN + self.lambdaAE * loss_AE + self.lambdaLA * loss_LA + self.lambdaMNN * loss_MNN + self.lambdaGeo*loss_Geo
             loss_G.backward()
             torch.nn.utils.clip_grad_norm_(params_G, 5.0)
-            optimizer_G.step()
+            self.optimizer_G.step()
 
             # ------------------------------------------------------------------
             # Periodic logging + checkpoint + loss history (every 2000 steps)
@@ -681,8 +709,8 @@ class Model(object):
                     state[f"G_{i}"] = self.G_dict[i].state_dict()
                 for i in range(num_datasets - 1):
                     state[f"D_{i}"] = self.D_dict[i].state_dict()
-                state["optimizer_G"] = optimizer_G.state_dict()
-                state["optimizer_D"] = optimizer_D.state_dict()
+                state["optimizer_G"] = self.optimizer_G.state_dict()
+                state["optimizer_D"] = self.optimizer_D.state_dict()
                 state["loss_D"] = float(loss_D)
                 state["loss_GAN"] = float(loss_G_GAN)
                 state["loss_AE"] = float(loss_AE)
@@ -718,8 +746,8 @@ class Model(object):
             state[f"G_{i}"] = self.G_dict[i].state_dict()
         for i in range(num_datasets - 1):
             state[f"D_{i}"] = self.D_dict[i].state_dict()
-        state["optimizer_G"] = optimizer_G.state_dict()
-        state["optimizer_D"] = optimizer_D.state_dict()
+        state["optimizer_G"] = self.optimizer_G.state_dict()
+        state["optimizer_D"] = self.optimizer_D.state_dict()
         self._atomic_save(state, ckpt_path)
         print(f"SCMODAL: Final integrate_datasets_feats checkpoint saved", flush=True)
 
