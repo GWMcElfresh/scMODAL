@@ -10,7 +10,9 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
 dependencies = [
-    "torch>=1.6.0",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "torchaudio==2.6.0",
     "scanpy>=1.7.2",
     "anndata>=0.7.6",
     "pandas>=1.1.5",
@@ -24,3 +26,13 @@ dependencies = [
     "igraph==0.11.4",
     "leidenalg==0.10.2"
 ]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124" }]
+torchvision = [{ index = "pytorch-cu124" }]
+torchaudio = [{ index = "pytorch-cu124" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
